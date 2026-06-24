@@ -5,6 +5,7 @@ from scipy import stats
 from scipy.ndimage import gaussian_filter1d
 import scipy.signal as sg
 from copy import deepcopy
+from joblib import Parallel, delayed
 
 from neuropy.core import Signal, ProbeGroup, Epoch
 from neuropy.utils.signal_process import WaveletSg, filter_sig
@@ -47,6 +48,7 @@ def _detect_freq_band_epochs(
     sigma,
     ignore_times=None,
     return_power=False,
+    custom_z_params=None,
 ):
     """Detects epochs of high power in a given frequency band
 
@@ -59,6 +61,9 @@ def _detect_freq_band_epochs(
     maxdur : float, optional
     chans : list
         channels used for epoch detection, if None then chooses best chans
+    custom_z_params: list, tuple, np.ndarray
+        (mean, std) to use for z-scoring power. Useful for across session comparisons
+
     """
 
     # lf, hf = freq_band
@@ -70,18 +75,8 @@ def _detect_freq_band_epochs(
     # mean: very conservative in cases where some shanks may not have that strong ripple
     # max: works well but may have occasional false positives
 
-    # # First, bandpass the signal in the range of interest
-    # power = np.zeros(signals.shape[1])
-    # for sig in signals:
-    #     yf = signal_process.filter_sig.bandpass(sig, lf=lf, hf=hf, fs=fs)
-    #     # zsc_chan = smooth(stats.zscore(np.abs(signal_process.hilbertfast(yf))))
-    #     # zscsignal[sig_i] = zsc_chan
-    #     power += np.abs(signal_process.hilbertfast(yf))
-    #
-    # # Second, take the mean and smooth the signal with a sigma wide gaussian kernel
-    # power = smooth(power / signals.shape[0])
-
-    # First get bandpass power, and second, smooth it
+    # First get bandpass power, and ...
+    # Second, smooth it
     power = get_bandpass_power(signals, freq_band, fs, sigma)
 
     # Third, exclude any noisy periods due to motion or other artifact
@@ -101,9 +96,14 @@ def _detect_freq_band_epochs(
 
     # Fourth, identify candidate epochs above edge_cutoff threshold
     # ---- thresholding and detection ------
-    power = stats.zscore(power)
-    # power_thresh = np.where(power >= edge_cutoff, power, 0)
-    power_thresh = np.where(power >= edge_cutoff, power, -100)  # NRK bugfix
+    power_abs = deepcopy(power)  # keep copy of absolute power before z-scoring to compare between sessions
+    print(f"Power mean={power_abs[power_abs != 0].mean()} and std={power_abs[power_abs != 0].std()}")
+    if custom_z_params is None:
+        power = stats.zscore(power)
+    else:
+        mu_custom, sigma_custom = custom_z_params
+        power = (power - mu_custom) / sigma_custom
+    power_thresh = np.where(power >= edge_cutoff, power, -100)
 
     # Fifth, refine candidate epochs to periods between lowthresh and highthresh
     peaks, props = sg.find_peaks(
@@ -111,6 +111,7 @@ def _detect_freq_band_epochs(
     )
     starts, stops = props["left_bases"], props["right_bases"]
     peaks_power = power_thresh[peaks]
+    peaks_power_abs = power_abs[peaks]
 
     # ----- merge overlapping epochs ------
     # Last, merge any epochs that overlap into one longer epoch
@@ -123,18 +124,20 @@ def _detect_freq_band_epochs(
             stops[i + 1] = max(stops[i], stops[i + 1])
 
             peaks_power[i + 1] = max(peaks_power[i], peaks_power[i + 1])
+            peaks_power_abs[i + 1] = max(peaks_power_abs[i], peaks_power_abs[i + 1])
             peaks[i + 1] = [peaks[i], peaks[i + 1]][
                 np.argmax([peaks_power[i], peaks_power[i + 1]])
             ]
 
             ind_delete.append(i)
 
-    epochs_arr = np.vstack((starts, stops, peaks, peaks_power)).T
-    starts, stops, peaks, peaks_power = np.delete(epochs_arr, ind_delete, axis=0).T
+    epochs_arr = np.vstack((starts, stops, peaks, peaks_power, peaks_power_abs)).T
+    starts, stops, peaks, peaks_power, peaks_power_abs = np.delete(epochs_arr, ind_delete, axis=0).T
 
     epochs_df = pd.DataFrame(
         dict(
-            start=starts, stop=stops, peak_time=peaks, peak_power=peaks_power, label=""
+            start=starts, stop=stops, peak_time=peaks, peak_power=peaks_power, peak_power_abs=peaks_power_abs,
+            label=""
         )
     )
     epochs_df[["start", "stop", "peak_time"]] /= fs  # seconds
@@ -709,6 +712,12 @@ class Ripple:
             rpl_frames = [np.arange(p - buffer_frames, p + buffer_frames) for p in peakframe]  # Grab 100ms either side of peak frame
             rpl_frames = np.concatenate(rpl_frames)
 
+            # Calculate peak frequency and power
+            if rpl_frames[-1] >= len(lfp):  # Check if the buffer frames for the last ripple extend beyond end of recording
+                rpl_frames = rpl_frames[:-(2 * buffer_frames)]  # Chop out last ripple
+                peakframe = peakframe[:-1]  # Chop out ripple from peakframe
+                rpl_epochs = rpl_epochs[:-1]  # Chop out last ripple from end
+                print("Last ripple too close to end of recording. Removed from rpl_epochs.")
             # Grab signal for ripples only
             new_sig = Signal(lfp[rpl_frames].reshape(1, -1), sampling_rate=sampling_rate)
 
@@ -734,6 +743,42 @@ class Ripple:
 
         return new_epochs
 
+    @staticmethod
+    def get_sharp_wave_amplitude(eegfile, ripple_epochs, chan_ids=None):
+        """Gets sharp-wave amplitude using specific channel_ids only"""
+
+        if chan_ids is None:
+            chan_ids = np.arange(eegfile.n_channels)
+
+        rpl_traces, t_frames = eegfile.get_frames_within_epochs(
+            ripple_epochs,
+            chan_ids,
+            ret_time=True
+        )
+
+        rpl_traces = filter_sig.bandpass(
+            rpl_traces,
+            lf=2,
+            hf=30,
+            fs=eegfile.sampling_rate
+        )
+
+        def process_swa(arr):
+            res = stats.binned_statistic(
+                t_frames,
+                arr,
+                bins=ripple_epochs.flatten(),
+                statistic=lambda x: x[np.argmax(np.abs(x))] if len(x) > 0 else np.nan
+            )[0]
+            return res[::2]
+
+        max_val = Parallel(n_jobs=-1)(
+            delayed(process_swa)(arr) for arr in rpl_traces
+        )
+
+        sw_amp = np.ptp(np.asarray(max_val), axis=0) * 0.95 * 1e-3
+
+        return sw_amp
 
 class Gamma:
     """Events and analysis related to gamma oscillations"""

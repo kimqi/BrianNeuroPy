@@ -7,7 +7,8 @@ from scipy import stats
 
 
 def plot_epochs(
-    epochs: Epoch, labels_order=None, colors="Set3", alpha=1, collapsed=False, colorby="label", ax=None
+    epochs: Epoch, labels_order=None, colors="Set3", alpha=1, collapsed=False, colorby="label", yaxis_label=True,
+        ax=None
 ):
     """Plots epochs on a given axis, with different style of plotting
 
@@ -25,6 +26,7 @@ def plot_epochs(
         [description], by default "gray", if dict = {"value1": color, "value2": color2}
         where value1, value2, ... are values in the column defined by colorby param
     colorby: str, column in epochs to map colors to
+    yaxis_label: bool, True (default) = add epoch labels to y axis
     collapsed:
 
     Returns
@@ -96,10 +98,17 @@ def plot_epochs(
         )
         ax.set_ylim([0, 1])
 
+    # Label epochs on plot
+    if not collapsed and yaxis_label:
+        yticks = np.linspace(1 / n_labels / 2, 1 - 1 / n_labels / 2, n_labels)
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(unique_labels)
+
     return ax
 
 
-def plot_hypnogram(epochs: Epoch, ax=None, unit="s", collapsed=False, annotate=False):
+def plot_hypnogram(epochs: Epoch, ax=None, labels: list or None = ["nrem", "rem", "quiet", "active"],
+                   unit="s", collapsed=False, annotate=False):
     """Plot hypnogram
 
     Parameters
@@ -108,6 +117,7 @@ def plot_hypnogram(epochs: Epoch, ax=None, unit="s", collapsed=False, annotate=F
         axis to plot onto, by default None
     tstart : float, optional
         start of hypnogram, by default 0.0, helps in positioning of hypnogram
+    labels : list or None, optional. None = use labels in epochs, default is ["nrem", "rem", "quiet", "active"]
     unit : str, optional
         unit of timepoints, 's'=seconds or 'h'=hour, by default "s"
     collapsed : bool, optional
@@ -126,7 +136,23 @@ def plot_hypnogram(epochs: Epoch, ax=None, unit="s", collapsed=False, annotate=F
         "quiet": "#b6afaf",
         "active": "#474343",
     }
-    labels = ["nrem", "rem", "quiet", "active"]
+    if labels is None:
+        labels = np.unique(epochs.labels)
+        span_starts = np.linspace(0, 1, len(labels) + 1)[:-1]
+        span_stops = np.linspace(0, 1, len(labels) + 1)[1:]
+        span_ = {}
+        for start, stop, label, color_name in zip(span_starts, span_stops, labels, colors.keys()):
+            if label not in colors.keys():
+                colors[label] = colors.pop(color_name)
+            span_[label] = [start, stop]
+
+    else:
+        span_ = {
+            "nrem": [0, 0.25],
+            "rem": [0.25, 0.5],
+            "quiet": [0.5, 0.75],
+            "active": [0.75, 1],
+        }
 
     if ax is None:
         _, ax = plt.subplots(1, 1)
@@ -137,12 +163,6 @@ def plot_hypnogram(epochs: Epoch, ax=None, unit="s", collapsed=False, annotate=F
     elif unit == "h":
         unit_norm = 3600
 
-    span_ = {
-        "nrem": [0, 0.25],
-        "rem": [0.25, 0.5],
-        "quiet": [0.5, 0.75],
-        "active": [0.75, 1],
-    }
 
     if annotate:
         for state in span_:

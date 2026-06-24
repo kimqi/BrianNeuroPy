@@ -66,8 +66,27 @@ def min_max_scaler(x, axis=-1):
     """
     min_val = np.min(x, axis=axis, keepdims=True)
     range_val = np.ptp(x, axis=axis, keepdims=True)
+    if np.any(np.isnan(x)):  # fix any rows with NaNs manually
+        bad_rows = np.where(np.any(np.isnan(x), axis=1))[0]
+        for idr in bad_rows:
+            rowclean = x[idr][~np.isnan(x[idr])]
+            min_val[idr] = np.min(rowclean)
+            range_val[idr] = np.min(rowclean)
+
     return (x - min_val)  / np.where(range_val == 0,1,range_val)
 
+def quantile_scaler(x, qb=0.025, qt=0.975, axis=-1):
+    """Scales data to quantiles specified in qb and qt"""
+    xmin, xtop = np.quantile(x, [qb, qt], axis=axis, keepdims=True)
+    if np.any(np.isnan(xmin)):  # fix any rows with NaNs manually
+        bad_rows = np.where(np.any(np.isnan(x), axis=1))[0]
+        for idr in bad_rows:
+            rowclean = x[idr][~np.isnan(x[idr])]
+            quant_row = np.quantile(rowclean, [qb, qt])
+            xmin[idr], xtop[idr] = quant_row
+    xrange = xtop - xmin
+
+    return (x - xmin) / xrange
 
 def min_max_external_scaler(x, xmin, xptp):
     """Scales the values of x according to a specified min value and peak-to-peak values.
